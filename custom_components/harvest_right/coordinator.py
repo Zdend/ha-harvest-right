@@ -268,9 +268,12 @@ class HarvestRightCoordinator(DataUpdateCoordinator[dict[int, dict]]):
             _LOGGER.debug("Minted MQTT client suffix %s", suffix)
         return suffix
 
-    @callback
     def _handle_mqtt_banned(self) -> None:
-        """Handle a terminal ban from the broker (paho thread)."""
+        """Handle a terminal ban from the broker (paho thread).
+
+        Not a @callback: this runs on paho's network thread, like its sibling
+        _handle_mqtt_connect_fail, and only marshals onto the loop.
+        """
         self.hass.loop.call_soon_threadsafe(self._async_handle_mqtt_banned)
 
     @callback
