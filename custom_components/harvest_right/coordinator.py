@@ -7,20 +7,26 @@ import contextlib
 from datetime import timedelta
 import logging
 import time
+import uuid
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import HarvestRightApi, HarvestRightApiError, HarvestRightAuthError
 from .const import (
+    CONF_CLIENT_SUFFIX,
     CONF_REFRESH_TOKEN,
     DEFAULT_SCAN_INTERVAL_MINUTES,
     DEFAULT_TEMPERATURE_UNIT,
     DOMAIN,
     EVENT_BATCH_SUMMARY,
+    ONLINE_PAYLOAD_CONTINUE,
+    ONLINE_PAYLOAD_START,
+    ONLINE_REFRESH_INTERVAL,
     OPT_SCAN_INTERVAL,
     OPT_TEMPERATURE_UNIT,
     STALE_THRESHOLD,
@@ -31,7 +37,7 @@ from .mqtt_client import HarvestRightMqttClient
 _LOGGER = logging.getLogger(__name__)
 
 # Background task intervals (seconds)
-_ONLINE_PUBLISH_INTERVAL = 30  # Republish "on" to keep telemetry flowing
+_ONLINE_PUBLISH_INTERVAL = 30  # Heartbeat on act/{cust}/on ("continue")
 _WATCHDOG_DEAD_THRESHOLD = 900  # 15 min of silence: force a full reconnect
 _MIN_TOKEN_REFRESH_INTERVAL = 300  # never hammer the auth endpoint faster
 _RECONNECT_INITIAL_DELAY = 60
@@ -74,6 +80,9 @@ class HarvestRightCoordinator(DataUpdateCoordinator[dict[int, dict]]):
         self._next_reconnect_attempt: float | None = None
         self._reconnect_delay = _RECONNECT_INITIAL_DELAY
         self._reconnect_in_progress = False
+        # Heartbeat bookkeeping — see _async_watchdog_loop.
+        self._last_online_start: float = 0.0
+        self._telemetry_was_silent = True
 
     # ── Setup / teardown ─────────────────────────────────────────────────
 
@@ -100,8 +109,10 @@ class HarvestRightCoordinator(DataUpdateCoordinator[dict[int, dict]]):
             self.api.email,
             self.api.access_token,
             self._handle_mqtt_message,
+            client_suffix=self._client_suffix(),
         )
         self.mqtt.set_on_connect_fail(self._handle_mqtt_connect_fail)
+        self.mqtt.set_on_banned(self._handle_mqtt_banned)
         # Register subscriptions before connecting so _on_connect picks
         # them up as soon as the broker link is established.
         for dryer in self.dryers:
@@ -233,7 +244,47 @@ class HarvestRightCoordinator(DataUpdateCoordinator[dict[int, dict]]):
     async def async_refresh_telemetry(self) -> None:
         """Republish 'on' immediately to prompt fresh telemetry."""
         if self.mqtt:
-            await self.hass.async_add_executor_job(self.mqtt.publish_online)
+            await self.hass.async_add_executor_job(
+                self.mqtt.publish_online, ONLINE_PAYLOAD_START
+            )
+
+    # ── Client identity ──────────────────────────────────────────────────
+
+    def _client_suffix(self) -> str:
+        """Return this install's MQTT client suffix, minting it once.
+
+        Stored in the config entry, so the client ID is stable for the life of
+        the install rather than per process. "Consistent client ID" was one of
+        Harvest Right's two stated conditions, and a suffix that survives only
+        until the next HA restart does not meet it.
+        """
+        suffix = self.entry.data.get(CONF_CLIENT_SUFFIX)
+        if not suffix:
+            suffix = uuid.uuid4().hex[:6]
+            self.hass.config_entries.async_update_entry(
+                self.entry,
+                data={**self.entry.data, CONF_CLIENT_SUFFIX: suffix},
+            )
+            _LOGGER.debug("Minted MQTT client suffix %s", suffix)
+        return suffix
+
+    @callback
+    def _handle_mqtt_banned(self) -> None:
+        """Handle a terminal ban from the broker (paho thread)."""
+        self.hass.loop.call_soon_threadsafe(self._async_handle_mqtt_banned)
+
+    @callback
+    def _async_handle_mqtt_banned(self) -> None:
+        """Stop all reconnect activity and surface the ban."""
+        self._next_reconnect_attempt = None
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            "mqtt_banned",
+            is_fixable=False,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="mqtt_banned",
+        )
 
     # ── Token persistence ────────────────────────────────────────────────
 
@@ -285,8 +336,12 @@ class HarvestRightCoordinator(DataUpdateCoordinator[dict[int, dict]]):
                 await asyncio.sleep(_ONLINE_PUBLISH_INTERVAL)
                 if not self.mqtt:
                     continue
+                if self.mqtt.banned:
+                    continue
 
-                await self.hass.async_add_executor_job(self.mqtt.publish_online)
+                await self.hass.async_add_executor_job(
+                    self.mqtt.publish_online, self._online_payload()
+                )
 
                 if self.mqtt.is_connected:
                     self._next_reconnect_attempt = None
@@ -306,6 +361,40 @@ class HarvestRightCoordinator(DataUpdateCoordinator[dict[int, dict]]):
             except Exception:
                 _LOGGER.exception("Error in MQTT watchdog, will retry")
 
+    def _online_payload(self) -> str:
+        """Choose this heartbeat's payload.
+
+        "continue" is the steady state. "on" is sent only when a resend is
+        actually wanted, in three cases:
+
+          · telemetry has been SILENT — nothing is streaming, so there is
+            nothing to duplicate, and a dryer that powered on after we
+            connected would otherwise never be asked to start. That gap is the
+            one thing missing from Harvest Right's own advice: with "on" sent
+            only at connect and every 24h, a unit that is power-cycled mid-run
+            can stay silent for most of a day.
+          · telemetry has just RESUMED after such a gap — re-arm it once.
+          · roughly daily, to re-request the `system` message.
+        """
+        now = time.monotonic()
+        silence = now - self.mqtt.last_message_time if self.mqtt else 0.0
+
+        if silence >= STALE_THRESHOLD.total_seconds():
+            self._telemetry_was_silent = True
+            self._last_online_start = now
+            return ONLINE_PAYLOAD_START
+
+        if self._telemetry_was_silent:
+            self._telemetry_was_silent = False
+            self._last_online_start = now
+            return ONLINE_PAYLOAD_START
+
+        if now - self._last_online_start >= ONLINE_REFRESH_INTERVAL:
+            self._last_online_start = now
+            return ONLINE_PAYLOAD_START
+
+        return ONLINE_PAYLOAD_CONTINUE
+
     def _handle_mqtt_connect_fail(self) -> None:
         """Handle an MQTT auth failure (paho thread)."""
         self.hass.loop.call_soon_threadsafe(
@@ -320,7 +409,7 @@ class HarvestRightCoordinator(DataUpdateCoordinator[dict[int, dict]]):
 
     async def _reconnect_mqtt(self) -> None:
         """Refresh and reconnect, sharing backoff across all retry triggers."""
-        if self.mqtt is None or self._reconnect_in_progress:
+        if self.mqtt is None or self._reconnect_in_progress or self.mqtt.banned:
             return
         now = time.monotonic()
         if (

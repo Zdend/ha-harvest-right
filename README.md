@@ -1,3 +1,29 @@
+> ## ⚠️ This is a fork
+>
+> Upstream `itsdrewmiller/ha-harvest-right` v0.9.1 still builds its MQTT client ID
+> as `<customer_id>-ha-device.*`. Harvest Right's broker **blocks that pattern
+> outright** — a brand-new install on an unrelated account was refused `Banned`
+> on its first ever connection. Installing upstream as-is risks the account.
+> See [issue #4](https://github.com/itsdrewmiller/ha-harvest-right/issues/4),
+> where Harvest Right's own engineer confirmed the block is deliberate, that
+> third-party MQTT clients are permitted, and that `<customer_id>-home-assist.*`
+> is the sanctioned replacement.
+>
+> This fork is v0.9.1 plus the four changes that issue asks for:
+>
+> 1. Client ID uses the sanctioned `-home-assist.` pattern.
+> 2. The client ID suffix is persisted in the config entry, so it is stable for
+>    the life of the install rather than regenerated per connection.
+> 3. A `Banned` (0x8A) CONNACK is terminal: it latches, raises a repair issue,
+>    and is honoured by **every** reconnect path — including `force_reconnect()`,
+>    which the 12-hourly token refresh calls and which previously ignored it.
+> 4. The 30-second keep-alive publishes `"continue"`; `"on"` is reserved for
+>    connect, a ~24h `system` refresh, and re-arming a dryer that has gone
+>    silent (the gap in Harvest Right's own advice — a unit power-cycled
+>    mid-batch would otherwise stay silent until the 24h timer).
+>
+> Rebase onto upstream and drop this fork once these land there.
+
 # Harvest Right for Home Assistant
 
 A Home Assistant custom integration for [Harvest Right](https://harvestright.com) freeze dryers. It connects to Harvest Right's cloud services to provide real-time, push-based sensor data for each of your freeze dryers.

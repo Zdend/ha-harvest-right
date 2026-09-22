@@ -8,14 +8,22 @@ import logging
 import ssl
 import threading
 import time
-import uuid
 
 from homeassistant.core import HomeAssistant
 import paho.mqtt.client as mqtt
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
 
-from .const import MQTT_BROKER, MQTT_KEEPALIVE, MQTT_PORT, MQTT_SESSION_EXPIRY
+from .const import (
+    MQTT_BROKER,
+    MQTT_CLIENT_ID_PREFIX,
+    MQTT_KEEPALIVE,
+    MQTT_PORT,
+    MQTT_RC_BANNED,
+    MQTT_SESSION_EXPIRY,
+    ONLINE_PAYLOAD_CONTINUE,
+    ONLINE_PAYLOAD_START,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +55,7 @@ class HarvestRightMqttClient:
         email: str,
         access_token: str,
         on_message: MessageCallback,
+        client_suffix: str,
     ) -> None:
         """Initialize the client wrapper (does not connect)."""
         self._hass = hass
@@ -54,9 +63,18 @@ class HarvestRightMqttClient:
         self._email = email
         self._access_token = access_token
         self._on_message = on_message
+        # Persisted by the coordinator in the config entry, so this install
+        # presents the SAME client ID for its whole life. Regenerating it per
+        # connection — as this client used to — makes a reconnect loop look
+        # like a swarm of distinct clients to the broker, which is the
+        # behaviour Harvest Right asked to see the back of.
+        self._client_suffix = client_suffix
+        # Latched on CONNACK 0x8A. Terminal for every reconnect path.
+        self._banned = False
         self._subscribed_dryers: set[int] = set()
         self._last_message_time: float = 0.0
         self._on_connect_fail: Callable[[], None] | None = None
+        self._on_banned: Callable[[], None] | None = None
         self._client: mqtt.Client | None = None
         self._lock = threading.Lock()
 
@@ -76,16 +94,26 @@ class HarvestRightMqttClient:
         client = self._client
         return client is not None and client.is_connected()
 
+    @property
+    def banned(self) -> bool:
+        """Return True if the broker has refused this client as Banned."""
+        return self._banned
+
     def set_on_connect_fail(self, callback: Callable[[], None]) -> None:
         """Set a callback invoked on connection authentication failure."""
         self._on_connect_fail = callback
+
+    def set_on_banned(self, callback: Callable[[], None]) -> None:
+        """Set a callback invoked once, when the broker reports Banned."""
+        self._on_banned = callback
 
     # ── Client construction ───────────────────────────────────────────────
 
     def _build_client(self) -> mqtt.Client:
         """Create and configure a fresh paho client (blocking)."""
-        suffix = uuid.uuid4().hex[:6]
-        client_id = f"{self._customer_id}-ha-device.{suffix}"
+        client_id = (
+            f"{self._customer_id}-{MQTT_CLIENT_ID_PREFIX}.{self._client_suffix}"
+        )
 
         client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -166,6 +194,12 @@ class HarvestRightMqttClient:
         builds a fresh one. Serialized with ``_lock``; safe to call from
         any thread.
         """
+        if self._banned:
+            # The path benspinks found still re-presenting a banned client every
+            # 12 hours: the token-refresh loop calls update_token ->
+            # force_reconnect, which never consulted the latch. It does now.
+            _LOGGER.debug("Skipping forced reconnect: client is banned")
+            return
         _LOGGER.info("Forcing MQTT reconnect")
         with self._lock:
             if new_token is not None:
@@ -210,20 +244,24 @@ class HarvestRightMqttClient:
             else:
                 _LOGGER.debug("Subscribed to %s", topic)
 
-    def publish_online(self) -> None:
-        """Publish 'on' to the online topic to keep telemetry flowing.
+    def publish_online(self, payload: str = ONLINE_PAYLOAD_CONTINUE) -> None:
+        """Publish to the online topic to keep telemetry flowing.
 
-        The dryer's WiFi adapter only sends telemetry while it knows a
-        client is listening. The web app publishes 'on' on connect and
-        periodically; we mirror that.
+        The dryer's WiFi adapter only sends telemetry while it knows a client
+        is listening. Defaults to "continue" — the cheap heartbeat. Pass
+        ONLINE_PAYLOAD_START ("on") only when a resend is actually wanted:
+        on connect, on the ~24h `system` refresh, or to re-arm a dryer that
+        has been silent. See the note in const.py.
         """
         client = self._client
         if client is None or not client.is_connected():
             return
         topic = f"act/{self._customer_id}/on"
-        info = client.publish(topic, "on", qos=0)
+        info = client.publish(topic, payload, qos=0)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
-            _LOGGER.debug("Publish 'on' to %s failed (rc=%s)", topic, info.rc)
+            _LOGGER.debug(
+                "Publish %r to %s failed (rc=%s)", payload, topic, info.rc
+            )
 
     # ── paho callbacks (run on paho's network thread) ─────────────────────
 
@@ -234,8 +272,29 @@ class HarvestRightMqttClient:
             _LOGGER.info("Connected to MQTT broker successfully")
             for dryer_id in list(self._subscribed_dryers):
                 self._subscribe_dryer_topics(client, dryer_id)
-            # Signal the dryer(s) to start sending telemetry.
-            client.publish(f"act/{self._customer_id}/on", "on", qos=0)
+            # Signal the dryer(s) to start sending telemetry. "on" is correct
+            # HERE and only here (plus the 24h refresh) — the periodic
+            # heartbeat uses "continue".
+            client.publish(
+                f"act/{self._customer_id}/on", ONLINE_PAYLOAD_START, qos=0
+            )
+        elif getattr(rc, "value", rc) == MQTT_RC_BANNED:
+            # 0x8A is terminal. Every retry from here is a client hammering a
+            # block the broker has already applied, which is precisely what got
+            # accounts flagged in the first place. Latch, tell the user, stop.
+            self._banned = True
+            _LOGGER.error(
+                "MQTT broker refused this client as Banned (0x8A). Not "
+                "retrying: reconnecting would only hammer a block that is "
+                "already in place. See "
+                "https://github.com/itsdrewmiller/ha-harvest-right/issues/4"
+            )
+            try:
+                client.disconnect()
+            except Exception:
+                _LOGGER.debug("disconnect() raised on ban", exc_info=True)
+            if self._on_banned is not None:
+                self._on_banned()
         else:
             _LOGGER.error("MQTT connection failed with code %s", rc)
             # Stop paho's auto-reconnect — the coordinator handles reconnection

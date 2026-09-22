@@ -52,6 +52,12 @@
       }
     }
   },
+  "issues": {
+    "mqtt_banned": {
+      "title": "Harvest Right has blocked this connection",
+      "description": "Harvest Right's MQTT broker refused this Home Assistant client with reason code 0x8A (Banned), so no freeze dryer telemetry can arrive. Home Assistant has stopped reconnecting on purpose: retrying only hammers a block that is already in place.\n\nThis integration uses the client ID pattern Harvest Right sanctions. If you are seeing this, an older ban may still be on the account \u2014 contact Harvest Right support and ask them to clear it, then reload the integration."
+    }
+  },
   "entity": {
     "sensor": {
       "temperature": { "name": "Temperature" },

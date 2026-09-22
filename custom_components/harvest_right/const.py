@@ -12,7 +12,41 @@ MQTT_PORT = 8883
 MQTT_KEEPALIVE = 20
 MQTT_SESSION_EXPIRY = 60
 
+# ── MQTT client identity ────────────────────────────────────────────────────
+#
+# Harvest Right's broker BLOCKS the `<customer_id>-ha-device.*` client ID shape
+# this integration used until now. The block is deliberate and matches on the
+# pattern, not on any individual client's behaviour: a brand-new install on an
+# unrelated account was refused `Banned` on its first ever connection (issue #3,
+# and the correction in issue #4). Harvest Right confirmed on 2026-08-26 that
+# third-party MQTT clients are permitted and that `<customer_id>-home-assist.*`
+# is the sanctioned replacement pattern.
+MQTT_CLIENT_ID_PREFIX = "home-assist"
+
+# MQTTv5 CONNACK reason code 0x8A — "Banned". Terminal: retrying a ban only
+# hammers a block that has already been applied.
+MQTT_RC_BANNED = 138
+
+# ── The act/{customer_id}/on topic ──────────────────────────────────────────
+#
+# The adapter only streams telemetry while it believes a client is listening,
+# and the topic carries plain strings. The two are NOT interchangeable:
+#
+#   "on"        asks the dryer to (re)start streaming, and makes it resend its
+#               most recent status PLUS a fresh `system` message.
+#   "continue"  just says "still here". No resend.
+#
+# Publishing "on" every 30s — as this integration did — is therefore a stream of
+# redundant resends for a client that is already monitoring continuously, and
+# Harvest Right named it as one of the conditions for not being flagged again.
+ONLINE_PAYLOAD_START = "on"
+ONLINE_PAYLOAD_CONTINUE = "continue"
+
+# How often to re-send "on" while telemetry is healthy, to re-request `system`.
+ONLINE_REFRESH_INTERVAL = 24 * 60 * 60
+
 # Config entry data keys
+CONF_CLIENT_SUFFIX = "client_suffix"
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_REFRESH_TOKEN = "refresh_token"
