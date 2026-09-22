@@ -23,6 +23,7 @@ def coordinator(hass):
     result.mqtt = MagicMock()
     result.mqtt.is_connected = False
     result.mqtt.last_message_time = 0
+    result.mqtt.banned = False
     return result
 
 
@@ -148,3 +149,22 @@ async def test_auth_failure_starts_reauth(coordinator):
         reauth.assert_called_once_with(coordinator.hass)
     coordinator.mqtt.force_reconnect.assert_not_called()
     assert coordinator._next_reconnect_attempt is None
+
+
+async def test_ban_stops_every_reconnect_path(coordinator):
+    """A banned client is never re-presented to the broker.
+
+    The ban is terminal by design: retrying only hammers a block that is
+    already in place, which is what got accounts flagged in the first place.
+    """
+    coordinator.mqtt.banned = True
+
+    await coordinator._async_refresh_and_reconnect()
+    assert coordinator.mqtt.force_reconnect.call_count == 0
+    assert coordinator.api.ensure_valid_token.call_count == 0
+
+    # The watchdog must not publish a heartbeat at a broker that has
+    # refused us either.
+    await _watchdog_tick(coordinator)
+    assert coordinator.mqtt.force_reconnect.call_count == 0
+    assert coordinator.mqtt.publish_online.call_count == 0

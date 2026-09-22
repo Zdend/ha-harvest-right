@@ -72,4 +72,5 @@ def mock_mqtt():
         instance.disconnect = AsyncMock()
         instance.is_connected = True
         instance.last_message_time = time.monotonic()
+        instance.banned = False
         yield instance
