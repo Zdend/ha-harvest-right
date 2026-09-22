@@ -111,9 +111,7 @@ class HarvestRightMqttClient:
 
     def _build_client(self) -> mqtt.Client:
         """Create and configure a fresh paho client (blocking)."""
-        client_id = (
-            f"{self._customer_id}-{MQTT_CLIENT_ID_PREFIX}.{self._client_suffix}"
-        )
+        client_id = f"{self._customer_id}-{MQTT_CLIENT_ID_PREFIX}.{self._client_suffix}"
 
         client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -259,9 +257,7 @@ class HarvestRightMqttClient:
         topic = f"act/{self._customer_id}/on"
         info = client.publish(topic, payload, qos=0)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
-            _LOGGER.debug(
-                "Publish %r to %s failed (rc=%s)", payload, topic, info.rc
-            )
+            _LOGGER.debug("Publish %r to %s failed (rc=%s)", payload, topic, info.rc)
 
     # ── paho callbacks (run on paho's network thread) ─────────────────────
 
@@ -275,9 +271,7 @@ class HarvestRightMqttClient:
             # Signal the dryer(s) to start sending telemetry. "on" is correct
             # HERE and only here (plus the 24h refresh) — the periodic
             # heartbeat uses "continue".
-            client.publish(
-                f"act/{self._customer_id}/on", ONLINE_PAYLOAD_START, qos=0
-            )
+            client.publish(f"act/{self._customer_id}/on", ONLINE_PAYLOAD_START, qos=0)
         elif getattr(rc, "value", rc) == MQTT_RC_BANNED:
             # 0x8A is terminal. Every retry from here is a client hammering a
             # block the broker has already applied, which is precisely what got

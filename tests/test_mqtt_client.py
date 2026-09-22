@@ -132,7 +132,7 @@ def test_publish_online_defaults_to_continue() -> None:
 
 
 def test_publish_online_can_request_a_resend() -> None:
-    """"on" is still available for connect / refresh / re-arm."""
+    """ "on" is still available for connect / refresh / re-arm."""
     client = _make_client(MagicMock())
     paho = MagicMock()
     paho.is_connected.return_value = True
