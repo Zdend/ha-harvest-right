@@ -20,6 +20,7 @@ TO_REDACT = {
     "accessToken",
     "refreshToken",
     "serial",
+    "serial_reported",
     "serialNumber",
     "cpuSerial",
     "aName",

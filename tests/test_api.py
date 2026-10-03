@@ -10,6 +10,7 @@ from custom_components.harvest_right.api import (
     HarvestRightApi,
     HarvestRightApiError,
     HarvestRightAuthError,
+    canonical_serial,
     normalize_dryer,
 )
 
@@ -39,6 +40,52 @@ def test_normalize_dryer_accepts_alternate_key_spellings() -> None:
     assert dryer["serial"] == "SN3"
     assert dryer["name"] == "Garage"
     assert dryer["model"] == "Large"
+
+
+@pytest.mark.parametrize(
+    ("reported", "expected"),
+    [
+        # The case this exists for: a re-add in the app reissues the serial.
+        ("2LG4BA325BBC00026-1", "2LG4BA325BBC00026"),
+        ("2LG4BA325BBC00026-12", "2LG4BA325BBC00026"),
+        # Untouched: no suffix at all.
+        ("2LG4BA325BBC00026", "2LG4BA325BBC00026"),
+        # Untouched: the base is too short to be a real serial, so the hyphen is
+        # part of the name rather than a reissue marker.
+        ("HR-1", "HR-1"),
+        # Untouched: four digits is past anything the dedupe produces, so this
+        # is a serial that genuinely ends that way.
+        ("2LG4BA325BBC00026-1234", "2LG4BA325BBC00026-1234"),
+        # Untouched: the suffix must be digits.
+        ("2LG4BA325BBC00026-A", "2LG4BA325BBC00026-A"),
+    ],
+)
+def test_canonical_serial(reported: str, expected: str) -> None:
+    """A re-registration suffix is stripped; anything else is left alone."""
+    assert canonical_serial(reported) == expected
+
+
+def test_normalize_dryer_keeps_identity_across_a_reissue() -> None:
+    """A reissued serial normalizes back onto the original identity."""
+    before = normalize_dryer({"id": 11, "serial": "2LG4BA325BBC00026"})
+    after = normalize_dryer({"id": 12, "serial": "2LG4BA325BBC00026-1"})
+
+    # Identity — what unique_ids and device identifiers are built from.
+    assert after["serial"] == before["serial"]
+    # The device name drives entity_id slugs, so it must not carry the suffix.
+    assert after["name"] == before["name"] == "2LG4BA325BBC00026"
+    # ...but what the cloud actually said is still recoverable.
+    assert after["serial_reported"] == "2LG4BA325BBC00026-1"
+    assert before["serial_reported"] == "2LG4BA325BBC00026"
+
+
+def test_normalize_dryer_keeps_a_real_name_over_the_serial() -> None:
+    """A dryer the user named keeps that name, suffix or not."""
+    dryer = normalize_dryer(
+        {"id": 13, "serial": "2LG4BA325BBC00026-1", "name": "Garage"}
+    )
+    assert dryer["name"] == "Garage"
+    assert dryer["serial"] == "2LG4BA325BBC00026"
 
 
 # ── login ────────────────────────────────────────────────────────────────
@@ -131,6 +178,45 @@ async def test_get_freeze_dryers_normalizes(
     assert len(dryers) == 1
     assert dryers[0]["id"] == 9
     assert dryers[0]["name"] == "Shed"
+
+
+async def test_get_freeze_dryers_collapses_a_reissued_serial(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    """A reissued dryer keeps the identity of the machine it replaced."""
+    aioclient_mock.post(f"{API_BASE}/auth/v1/refresh-token", json=auth_response())
+    aioclient_mock.get(
+        f"{API_BASE}/freeze-dryer/v1",
+        json=[{"id": 42, "serial": "2LG4BA325BBC00026-1"}],
+    )
+    api = HarvestRightApi(async_get_clientsession(hass), EMAIL, refresh_token="r")
+    dryers = await api.get_freeze_dryers()
+    assert dryers[0]["serial"] == "2LG4BA325BBC00026"
+    assert dryers[0]["serial_reported"] == "2LG4BA325BBC00026-1"
+
+
+async def test_get_freeze_dryers_keeps_serials_that_would_collide(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    """Collapsing must never merge two machines onto one identity.
+
+    If both the original and its reissue are on the account at once, the suffix
+    is the only thing telling them apart, so every reported serial is kept.
+    """
+    aioclient_mock.post(f"{API_BASE}/auth/v1/refresh-token", json=auth_response())
+    aioclient_mock.get(
+        f"{API_BASE}/freeze-dryer/v1",
+        json=[
+            {"id": 1, "serial": "2LG4BA325BBC00026"},
+            {"id": 2, "serial": "2LG4BA325BBC00026-1"},
+        ],
+    )
+    api = HarvestRightApi(async_get_clientsession(hass), EMAIL, refresh_token="r")
+    dryers = await api.get_freeze_dryers()
+    assert [d["serial"] for d in dryers] == [
+        "2LG4BA325BBC00026",
+        "2LG4BA325BBC00026-1",
+    ]
 
 
 async def test_get_freeze_dryers_bad_payload_raises(
