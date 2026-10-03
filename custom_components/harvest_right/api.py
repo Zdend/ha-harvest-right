@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -29,6 +30,29 @@ class HarvestRightApiError(Exception):
     """Raised when an API call fails for a non-auth reason."""
 
 
+# Re-registering a dryer in the Harvest Right app does not reuse its record. The
+# backend dedupes against the serial still held by the old one and hands back
+# `<SERIAL>-1` (then -2, -3...) for the new one. Because the serial is what this
+# integration builds unique IDs and device identifiers from, that reissue looks
+# like a brand new machine: Home Assistant creates a parallel set of entities,
+# the originals go `unavailable` forever, and every dashboard, automation and
+# statistic silently keeps pointing at the dead half.
+#
+# The physical machine has not changed, so neither should its identity. A base
+# of at least 6 characters keeps this away from short placeholder serials, and
+# the suffix is capped at 3 digits so a serial that genuinely ends in a hyphen
+# and a long number is left alone.
+_DUPLICATE_SERIAL_RE = re.compile(r"^(?P<base>.{6,}?)-(?P<copy>\d{1,3})$")
+
+
+def canonical_serial(serial: str) -> str:
+    """Strip a re-registration suffix so a re-added dryer keeps its identity."""
+    match = _DUPLICATE_SERIAL_RE.match(serial)
+    if match is None:
+        return serial
+    return match.group("base")
+
+
 def normalize_dryer(raw: dict[str, Any]) -> dict[str, Any]:
     """Normalize a raw dryer dict from the API into a known shape.
 
@@ -52,14 +76,27 @@ def normalize_dryer(raw: dict[str, Any]) -> dict[str, Any]:
         or str(dryer_id)
     )
 
-    name = (
-        raw.get("dryer_name") or raw.get("dryerName") or raw.get("name") or str(serial)
+    serial = str(serial)
+    # `serial` is identity; `serial_reported` is what the cloud actually said, so
+    # diagnostics can still show the reissue.
+    reported = serial
+    serial = canonical_serial(serial)
+
+    name = str(
+        raw.get("dryer_name") or raw.get("dryerName") or raw.get("name") or serial
     )
+    # An unnamed dryer is named after its serial by the cloud, so a reissue drags
+    # the suffix into the device name too — and with `_attr_has_entity_name` the
+    # device name is what every entity_id is slugified from. Left alone, a fresh
+    # install after a reissue would build `sensor.<serial>_1_vacuum_pressure`.
+    if name == reported:
+        name = serial
 
     return {
         "id": int(dryer_id),
-        "serial": str(serial),
-        "name": str(name),
+        "serial": serial,
+        "serial_reported": reported,
+        "name": name,
         "model": raw.get("model") or raw.get("dryerModel"),
         "firmware": raw.get("firmware") or raw.get("firmwareVersion"),
         "hardware": raw.get("hardware") or raw.get("hardwareVersion"),
@@ -240,7 +277,28 @@ class HarvestRightApi:
             raise HarvestRightApiError(
                 f"Unexpected dryer-list payload type: {type(payload).__name__}"
             )
-        return [normalize_dryer(item) for item in payload if isinstance(item, dict)]
+        dryers = [normalize_dryer(item) for item in payload if isinstance(item, dict)]
+
+        # Collapsing the suffix must never merge two machines. If it would, the
+        # suffix was load-bearing after all — keep every reported serial as-is.
+        serials = [d["serial"] for d in dryers]
+        if len(set(serials)) != len(serials):
+            _LOGGER.warning(
+                "Canonical serials collide (%s); keeping the reported serials",
+                ", ".join(sorted(set(serials))),
+            )
+            for dryer in dryers:
+                dryer["serial"] = dryer["serial_reported"]
+        else:
+            for dryer in dryers:
+                if dryer["serial"] != dryer["serial_reported"]:
+                    _LOGGER.info(
+                        "Dryer %s was reissued as %s; keeping its original identity",
+                        dryer["serial"],
+                        dryer["serial_reported"],
+                    )
+
+        return dryers
 
     async def _get_dryers_raw(self) -> aiohttp.ClientResponse:
         """Issue the freeze-dryer GET, mapping connection errors to API errors."""
